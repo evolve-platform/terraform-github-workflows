@@ -1,0 +1,161 @@
+name: Module Release
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: "The version branch to be worked on"
+        required: true
+        type: string
+        default: "main"
+      provider:
+        description: "The provider the module is based on"
+        required: false
+        type: string
+        default: "aws"
+      working-directory:
+        description: "The directory of the Terraform module"
+        required: true
+        type: string
+
+jobs:
+  Release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          base: ${{ github.event.inputs.branch }}
+          filters: |
+            changelog:
+              - added|modified: ${{ github.event.inputs.working-directory }}/CHANGELOG.md
+            notes:
+              - added: ${{ github.event.inputs.working-directory }}/.changes/*.md
+            unreleased:
+              - deleted: ${{ github.event.inputs.working-directory }}/.changes/unreleased/*.yaml
+
+      - name: Check for changelog items
+        id: status
+        shell: bash
+        run: |
+          if find ${{ github.event.inputs.working-directory }}/.changes/unreleased/ -name '*.yaml' | grep .;  then
+            echo "create_release=true" >> $GITHUB_OUTPUT
+            echo "is_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "create_release=false" >> $GITHUB_OUTPUT
+            echo "is_release=${IS_RELEASE}" >> $GITHUB_OUTPUT
+        env:
+          IS_RELEASE: ${{ steps.changes.outputs.changelog == 'true' && steps.changes.outputs.notes == 'true' && steps.changes.outputs.unreleased == 'true' }}
+
+      - name: Output changes
+        if: steps.status.outputs.create_release == 'true'
+        uses: labdigital-main/github-changie-action
+        id: changelog
+        with:
+          version: latest
+          args: batch --dry-run auto
+
+      - name: Batch changes
+        if: steps.status.outputs.create_release == 'true'
+        uses: labdigital-main/github-changie-action
+        with:
+          path: ${{ github.event.inputs.working-directory }}
+          version: latest
+          args: batch auto
+
+      - name: Merge changes
+        if: steps.status.outputs.create_release == 'true'
+        uses: labdigital-main/github-changie-action
+        with:
+          path: ${{ github.event.inputs.working-directory }}
+          version: latest
+          args: merge
+
+      - name: Get the latest version
+        id: latest
+        if: steps.status.outputs.create_release == 'true' || steps.status.outputs.is_release == 'true'
+        uses: labdigital-main/github-changie-action
+        with:
+          path: ${{ github.event.inputs.working-directory }}
+          version: latest
+          args: latest
+
+      - name: Get the terraform module version
+        id: terraform-version
+        env:
+          version: ${{ steps.latest.outputs.output }}
+        run: |
+          echo "terraform_version=${version/v/}" >> $GITHUB_OUTPUT
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        if: steps.status.outputs.create_release == 'true'
+        with:
+          title: Release ${{ steps.latest.outputs.output }}
+          branch: release/${{ steps.latest.outputs.output }}
+          commit-message: Release ${{ steps.latest.outputs.output }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            This PR was automatically created. When you're ready to do a release, you can merge this pull request. If you're not ready to do a release yet, that's fine, whenever you add more changes to main, this PR will be updated.
+
+            # Releases
+            ${{ steps.changelog.outputs.output }}
+
+      - name: Create tag
+        if: steps.status.outputs.is_release == 'true'
+        uses: actions/github-script@v7
+        env:
+          version: ${{ steps.latest.outputs.output }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${process.env.version}`,
+              sha: context.sha
+            })
+
+      - name: Create release notes
+        if: steps.status.outputs.is_release == 'true'
+        shell: bash
+        id: release-notes
+        run: |
+          BODY=$(cat ${{ github.event.inputs.working-directory }}/.changes/${{ steps.latest.outputs.output }}.md | sed -n '1!p')
+
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "body<<$EOF" >> $GITHUB_OUTPUT
+          echo "$BODY" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        if: steps.status.outputs.is_release == 'true'
+        uses: actions/github-script@v7
+        env:
+          version: ${{ steps.latest.outputs.output }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          retries: 3
+          script: |
+            github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: process.env.version,
+              body: `${{ steps.release-notes.outputs.body }}`,
+              tag_name: process.env.version,
+              draft: false,
+            })
+
+      - name: Create zip for deploying
+        if: steps.status.outputs.is_release == 'true'
+        run: zip -r "${{ steps.terraform-version.outputs.terraform_version }}".zip ${{ github.event.inputs.working-directory }}/*

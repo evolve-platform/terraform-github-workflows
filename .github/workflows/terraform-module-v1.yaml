@@ -1,0 +1,116 @@
+name: Terraform module
+
+on:
+  workflow_call:
+
+jobs:
+  tf-fmt:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Terraform fmt -check
+        run: |
+          terraform fmt -recursive -check | while IFS= read -r filename; do
+            if [[ -f "$filename" ]]; then
+              echo "::error file=$filename::invalid formatted file"
+            fi
+          done
+          terraform fmt -recursive -check
+
+  tf-lint:
+    name: Run TFlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        name: Install TFLint
+        with:
+          tflint_version: v0.44.1
+
+      - name: Setup TFLint
+        run: tflint --init
+        env:
+          # https://github.com/terraform-linters/tflint/blob/master/docs/user-guide/plugins.md#avoiding-rate-limiting
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Run TFLint
+        run: tflint -f compact --force
+
+  tf-docs:
+    name: Check Terraform docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Check Terraform Docs
+        uses: terraform-docs/gh-actions@v1.0.0
+        with:
+          working-dir: ${{ inputs.working-directory }}
+          output-file: "README.md"
+          output-method: ""
+          template: ""
+          fail-on-diff: true
+
+  check-changes:
+    name: Check for Changelog updates
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.head.ref, '.tf')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Filter for changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          base: main
+          filters: |
+            terraform:
+              - added: '**.tf'
+              - modified: '**.tf'
+            unreleased:
+              - added: .changes/unreleased/*.yaml
+
+      - name: Output changes
+        if:  ${{ steps.changes.outputs.unreleased == 'false' && steps.changes.outputs.terraform == 'true' }}
+        run: |
+          echo "No new changelog found in .changes/unreleased/ directory. Please add the necessary changes with Changie."
+          exit 1
+
+  trivy:
+    name: Run Trivy Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in IaC mode
+        uses: aquasecurity/trivy-action@0.21.0
+        with:
+          scan-type: 'config'
+          hide-progress: false
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
