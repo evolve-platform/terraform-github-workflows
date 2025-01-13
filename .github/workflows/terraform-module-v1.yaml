@@ -71,7 +71,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Filter for changes
-        uses: dorny/paths-filter@v2
+        uses: dorny/paths-filter@v3
         id: changes
         with:
           base: main
