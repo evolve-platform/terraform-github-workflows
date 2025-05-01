@@ -65,7 +65,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
 
       - name: Check Terraform Docs
-        uses: terraform-docs/gh-actions@v1.0.0
+        uses: terraform-docs/gh-actions@v1.4.1
         with:
           working-dir: ${{ inputs.working-directory }}
           output-file: "README.md"
