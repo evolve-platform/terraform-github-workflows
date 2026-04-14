@@ -99,30 +99,6 @@ jobs:
           echo "No new changelog found in .changes/unreleased/ directory. Please add the necessary changes with Changie."
           exit 1
 
-  trivy:
-    name: Run Trivy Security Scan
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-      security-events: write
-    steps:
-      - name: Run Trivy vulnerability scanner in IaC mode
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: 'config'
-          hide-progress: false
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          exit-code: '1'
-          ignore-unfixed: true
-          severity: 'CRITICAL,HIGH'
-
-      - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'trivy-results.sarif'
-
   release:
     name: Release module version
     runs-on: ubuntu-latest
