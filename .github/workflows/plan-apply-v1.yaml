@@ -1,9 +1,9 @@
-name: OpenTofu plan and apply
+name: Plan and apply
 
-# A site's infrastructure, planned with OpenTofu on a pull request and applied
-# from the default branch, through the site's own Taskfile so CI runs what a
-# laptop runs. Called from another repository with `uses:` and pinned by commit
-# sha; the README describes the inputs and the identities.
+# A site's infrastructure, planned on a pull request and applied from the
+# default branch, with Terraform or OpenTofu. Called from another repository
+# with `uses:` and pinned by commit sha; the README describes the inputs and
+# the identities.
 
 on:
   workflow_call:
@@ -20,42 +20,29 @@ on:
         description: "gcp or azure: where the identities live."
         required: true
         type: string
-      working-directory:
-        description: "The directory holding the Taskfile and the OpenTofu root module."
+      cli:
+        description: "terraform or tofu."
         required: true
         type: string
-      init-task:
-        description: "The task that initializes the backend, with its arguments. Defaults to <environment>:init."
+      cli-version:
+        description: "The version of the cli, such as 1.13.3."
+        required: true
+        type: string
+      working-directory:
+        description: "The directory holding the root module."
+        required: false
+        type: string
+        default: "."
+      backend-config:
+        description: "The backend configuration file, relative to the working directory. Defaults to envs/<environment>.backend.hcl where that file exists."
         required: false
         type: string
         default: ""
-      plan-task:
-        description: "The task that plans; it must run TF_CLI and pass CLI_ARGS on to its plan. Defaults to <environment>:plan."
+      var-file:
+        description: "The variables file, relative to the working directory. Defaults to envs/<environment>.tfvars where that file exists."
         required: false
         type: string
         default: ""
-      apply-task:
-        description: "The task that applies; it must run TF_CLI and pass CLI_ARGS on to its apply. Defaults to <environment>:apply."
-        required: false
-        type: string
-        default: ""
-      tofu-version:
-        required: false
-        type: string
-        default: "1.13.9"
-      task-version:
-        required: false
-        type: string
-        default: "3.54.0"
-      sops-version:
-        required: false
-        type: string
-        default: "3.13.3"
-      sops-sha256:
-        description: "The SHA-256 of the sops linux.amd64 binary of sops-version."
-        required: false
-        type: string
-        default: "e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b"
       comment:
         description: "Whether a plan is also posted as a comment on the pull request, besides the job summary."
         required: false
@@ -108,45 +95,41 @@ jobs:
     # One plan per pull request and environment; a newer push replaces it. The
     # state lock keeps a plan and an apply from overlapping.
     concurrency:
-      group: opentofu-plan-${{ github.repository }}-${{ inputs.environment }}-${{ github.ref }}
+      group: plan-${{ github.repository }}-${{ inputs.environment }}-${{ github.ref }}
       cancel-in-progress: true
     env:
       ENVIRONMENT: ${{ inputs.environment }}
       CLOUD: ${{ inputs.cloud }}
-      INIT_TASK: ${{ inputs.init-task }}
-      PLAN_TASK: ${{ inputs.plan-task }}
-      # The Taskfiles run TF_CLI, which defaults to terraform.
-      TF_CLI: tofu
+      CLI: ${{ inputs.cli }}
+      BACKEND_CONFIG: ${{ inputs.backend-config }}
+      VAR_FILE: ${{ inputs.var-file }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     steps:
       - name: Check the inputs
+        working-directory: .
         run: |
           case "$CLOUD" in gcp|azure) ;; *) echo "::error::cloud must be gcp or azure, not '$CLOUD'"; exit 1 ;; esac
+          case "$CLI" in terraform|tofu) ;; *) echo "::error::cli must be terraform or tofu, not '$CLI'"; exit 1 ;; esac
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Set up Terraform
+        if: inputs.cli == 'terraform'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.cli-version }}
+          terraform_wrapper: false
+
       - name: Set up OpenTofu
+        if: inputs.cli == 'tofu'
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
-          tofu_version: ${{ inputs.tofu-version }}
+          tofu_version: ${{ inputs.cli-version }}
           tofu_wrapper: false
-
-      - name: Set up Task
-        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
-        with:
-          version: ${{ inputs.task-version }}
-          repo-token: ${{ github.token }}
-
-      - name: Set up sops
-        env:
-          SOPS_VERSION: ${{ inputs.sops-version }}
-          SOPS_SHA256: ${{ inputs.sops-sha256 }}
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/sops" "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64"
-          echo "${SOPS_SHA256}  $RUNNER_TEMP/sops" | sha256sum --check --strict
-          install -m 0755 "$RUNNER_TEMP/sops" /usr/local/bin/sops
 
       - name: Sign in to Google Cloud
         if: inputs.cloud == 'gcp'
@@ -163,7 +146,7 @@ jobs:
           tenant-id: ${{ inputs.azure-tenant-id }}
           subscription-id: ${{ inputs.azure-subscription-id }}
 
-      - name: Use the Azure identity in OpenTofu
+      - name: Use the Azure identity in the providers
         if: inputs.cloud == 'azure'
         env:
           CLIENT_ID: ${{ inputs.azure-plan-client-id }}
@@ -178,29 +161,34 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Init
-        working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          read -ra task_args <<< "${INIT_TASK:-$ENVIRONMENT:init}"
-          task "${task_args[@]}" TF_CLI=tofu -- -input=false
+          backend="${BACKEND_CONFIG:-envs/$ENVIRONMENT.backend.hcl}"
+          args=()
+          if [ -n "$BACKEND_CONFIG" ] || [ -f "$backend" ]; then
+            args+=("-backend-config=$backend")
+          fi
+          "$CLI" init -input=false -no-color -reconfigure "${args[@]}"
 
       - name: Plan
-        working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          read -ra task_args <<< "${PLAN_TASK:-$ENVIRONMENT:plan}"
-          task "${task_args[@]}" TF_CLI=tofu -- -input=false -no-color -lock-timeout=10m -out=tfplan
+          vars="${VAR_FILE:-envs/$ENVIRONMENT.tfvars}"
+          args=()
+          if [ -n "$VAR_FILE" ] || [ -f "$vars" ]; then
+            args+=("-var-file=$vars")
+          fi
+          "$CLI" plan -input=false -no-color -lock-timeout=10m "${args[@]}" -out=tfplan
 
-      # tofu show prints a sensitive value as (sensitive value), so a
-      # secret reaches the summary or the comment only when it is not marked
-      # sensitive in the configuration.
+      # show prints a sensitive value as (sensitive value), so a secret reaches
+      # the summary or the comment only when the configuration does not mark it
+      # sensitive.
       - name: Write the plan to the summary
-        working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          tofu show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
+          "$CLI" show -no-color tfplan > "$RUNNER_TEMP/plan.txt"
           {
-            echo "### OpenTofu plan: $ENVIRONMENT"
+            echo "### Plan: $ENVIRONMENT"
             echo
             echo '```'
             head -c 60000 "$RUNNER_TEMP/plan.txt"
@@ -216,13 +204,13 @@ jobs:
           script: |
             const fs = require("node:fs");
             const environment = process.env.ENVIRONMENT;
-            const marker = `<!-- opentofu-plan:${environment} -->`;
+            const marker = `<!-- infrastructure-plan:${environment} -->`;
             const limit = 60000;
             let plan = fs.readFileSync(process.env.PLAN_FILE, "utf8");
             if (plan.length > limit) {
               plan = `${plan.slice(0, limit)}\n… truncated; the full plan is in the job summary.`;
             }
-            const body = `${marker}\n### OpenTofu plan: ${environment}\n\n<details><summary>Show the plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n\n</details>\n\n${context.sha}`;
+            const body = `${marker}\n### Plan: ${environment}\n\n<details><summary>Show the plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n\n</details>\n\n${context.sha}`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
@@ -242,23 +230,27 @@ jobs:
       id-token: write
     # Applies of one environment run one at a time and are never cancelled.
     concurrency:
-      group: opentofu-apply-${{ github.repository }}-${{ inputs.environment }}
+      group: apply-${{ github.repository }}-${{ inputs.environment }}
       cancel-in-progress: false
     env:
       ENVIRONMENT: ${{ inputs.environment }}
       CLOUD: ${{ inputs.cloud }}
-      INIT_TASK: ${{ inputs.init-task }}
-      APPLY_TASK: ${{ inputs.apply-task }}
-      # The Taskfiles run TF_CLI, which defaults to terraform.
-      TF_CLI: tofu
+      CLI: ${{ inputs.cli }}
+      BACKEND_CONFIG: ${{ inputs.backend-config }}
+      VAR_FILE: ${{ inputs.var-file }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     steps:
       # An apply plans afresh from the default branch; a plan made on a pull
       # request is never applied.
       - name: Check the inputs and the branch
+        working-directory: .
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           case "$CLOUD" in gcp|azure) ;; *) echo "::error::cloud must be gcp or azure, not '$CLOUD'"; exit 1 ;; esac
+          case "$CLI" in terraform|tofu) ;; *) echo "::error::cli must be terraform or tofu, not '$CLI'"; exit 1 ;; esac
           if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
             echo "::error::An apply runs only from the default branch, not from $GITHUB_REF"
             exit 1
@@ -268,27 +260,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Terraform
+        if: inputs.cli == 'terraform'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ inputs.cli-version }}
+          terraform_wrapper: false
+
       - name: Set up OpenTofu
+        if: inputs.cli == 'tofu'
         uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
-          tofu_version: ${{ inputs.tofu-version }}
+          tofu_version: ${{ inputs.cli-version }}
           tofu_wrapper: false
-
-      - name: Set up Task
-        uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
-        with:
-          version: ${{ inputs.task-version }}
-          repo-token: ${{ github.token }}
-
-      - name: Set up sops
-        env:
-          SOPS_VERSION: ${{ inputs.sops-version }}
-          SOPS_SHA256: ${{ inputs.sops-sha256 }}
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "$RUNNER_TEMP/sops" "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64"
-          echo "${SOPS_SHA256}  $RUNNER_TEMP/sops" | sha256sum --check --strict
-          install -m 0755 "$RUNNER_TEMP/sops" /usr/local/bin/sops
 
       - name: Sign in to Google Cloud
         if: inputs.cloud == 'gcp'
@@ -305,7 +289,7 @@ jobs:
           tenant-id: ${{ inputs.azure-tenant-id }}
           subscription-id: ${{ inputs.azure-subscription-id }}
 
-      - name: Use the Azure identity in OpenTofu
+      - name: Use the Azure identity in the providers
         if: inputs.cloud == 'azure'
         env:
           CLIENT_ID: ${{ inputs.azure-apply-client-id }}
@@ -320,15 +304,21 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Init
-        working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          read -ra task_args <<< "${INIT_TASK:-$ENVIRONMENT:init}"
-          task "${task_args[@]}" TF_CLI=tofu -- -input=false
+          backend="${BACKEND_CONFIG:-envs/$ENVIRONMENT.backend.hcl}"
+          args=()
+          if [ -n "$BACKEND_CONFIG" ] || [ -f "$backend" ]; then
+            args+=("-backend-config=$backend")
+          fi
+          "$CLI" init -input=false -no-color -reconfigure "${args[@]}"
 
       - name: Apply
-        working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
-          read -ra task_args <<< "${APPLY_TASK:-$ENVIRONMENT:apply}"
-          task "${task_args[@]}" TF_CLI=tofu -- -input=false -no-color -lock-timeout=10m -auto-approve
+          vars="${VAR_FILE:-envs/$ENVIRONMENT.tfvars}"
+          args=()
+          if [ -n "$VAR_FILE" ] || [ -f "$vars" ]; then
+            args+=("-var-file=$vars")
+          fi
+          "$CLI" apply -input=false -no-color -lock-timeout=10m -auto-approve "${args[@]}"
